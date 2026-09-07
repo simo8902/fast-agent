@@ -14,8 +14,8 @@ social:
 Codex Responses includes [stable prompt-cache keys and cache-preserving Astra effort changes](responses-caching.md).
 
 Use the `codex` pack to start **fast-agent** with a coding agent, a
-Codex-optimised filesystem search sub-agent, Responses-family transport, and an
-`apply_patch` tool that matches the Codex CLI patch format.
+Codex-optimised filesystem search sub-agent, Responses-family transport, and
+model-selected filesystem editing tools.
 
 ```bash
 uvx fast-agent-mcp@latest --pack codex
@@ -28,12 +28,22 @@ This starts **fast-agent** pre-configured for a Codex-style coding workflow.
 - A `dev` coding agent for interactive software work
 - A bounded rg-first search helper backed by `codexspark`
 - WebSocket-capable transport for modern Codex/OpenAI models
-- An `apply_patch` tool with a familiar Codex CLI-style patch signature
+- Filesystem editing tools selected for the model: Astra defaults to
+  `write_text_file` plus `edit_file`; patch-oriented models use `apply_patch`
 - Preconfigured MCP targets available from `/mcp attach`
 
 The coding agent has a minimal system prompt plus tools for the shell,
 filesystem and **fast-agent** services. `AGENTS.md` is included automatically if
 present. Customise the agent by editing `.fast-agent/agent-cards/dev.md`.
+
+Astra's writer/editor default applies to both Responses and Codex Responses,
+including the `astra` and `codexplan` aliases. To explicitly select the
+Codex-style patch interface instead:
+
+```yaml
+shell_execution:
+  write_text_file_mode: apply_patch
+```
 
 When `apply_patch` tool calls are previewed in the console, large patches are
 collapsed with a `(+N more lines)` tail. You can tune or disable that limit via
