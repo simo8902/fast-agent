@@ -1009,6 +1009,49 @@ async def test_write_text_file_auto_mode_prefers_apply_patch_for_codex_family_mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "codexplan",
+        "astra",
+        "gpt-6-astra",
+        "codexresponses.gpt-6-astra",
+        "responses.gpt-6-astra",
+        "codexresponses.gpt-6-astra?reasoning=low",
+        "responses.gpt-6-astra?reasoning=max",
+    ],
+)
+async def test_astra_defaults_to_writer_editor_pair(model_name: str) -> None:
+    config = AgentConfig(
+        name="test", instruction="Instruction", servers=[], shell=True, model=model_name
+    )
+    agent = McpAgent(config=config, context=Context())
+
+    tool_names = {tool.name for tool in (await agent.list_tools()).tools}
+    assert {"bash", "process", "read_text_file", "write_text_file", "edit_file"} <= tool_names
+    assert "apply_patch" not in tool_names
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["codexresponses.gpt-6-astra", "responses.gpt-6-astra"])
+async def test_astra_explicit_apply_patch_overrides_writer_editor_default(model_name: str) -> None:
+    settings = Settings(shell_execution=ShellSettings(write_text_file_mode="apply_patch"))
+    config = AgentConfig(
+        name="test", instruction="Instruction", servers=[], shell=True, model=model_name
+    )
+    agent = McpAgent(config=config, context=Context(config=settings))
+
+    tool_names = {tool.name for tool in (await agent.list_tools()).tools}
+    assert "apply_patch" in tool_names
+    assert "write_text_file" not in tool_names
+    assert "edit_file" not in tool_names
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", ["gpt-5", "gpt-5.0", "gpt-5.1"])
 async def test_write_text_file_auto_mode_keeps_write_and_edit_for_pre_52_gpt5_models(
     model_name: str,
@@ -1195,9 +1238,9 @@ async def test_write_text_file_auto_mode_uses_context_default_model_when_agent_m
     agent = McpAgent(config=config, context=Context(config=settings))
 
     tool_names = {tool.name for tool in (await agent.list_tools()).tools}
-    assert "write_text_file" not in tool_names
-    assert "apply_patch" in tool_names
-    assert "edit_file" not in tool_names
+    assert "write_text_file" in tool_names
+    assert "apply_patch" not in tool_names
+    assert "edit_file" in tool_names
 
     await agent._aggregator.close()
 

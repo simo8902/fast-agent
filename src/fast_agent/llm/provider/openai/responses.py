@@ -4,6 +4,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, ClassVar, Literal
+from uuid import uuid4
 
 from mcp import Tool
 from mcp_types import ContentBlock, TextContent
@@ -12,7 +13,6 @@ from openai import APIError, AsyncOpenAI, AuthenticationError, DefaultAioHttpCli
 from fast_agent.constants import (
     ANTHROPIC_CITATIONS_CHANNEL,
     ANTHROPIC_SERVER_TOOLS_CHANNEL,
-    FAST_AGENT_SAFETY_DETAILS,
     OPENAI_ASSISTANT_MESSAGE_ITEMS,
     OPENAI_MCP_LIST_TOOLS_ITEMS,
     OPENAI_REASONING_ENCRYPTED,
@@ -21,7 +21,6 @@ from fast_agent.constants import (
 from fast_agent.core.exceptions import (
     ModelConfigError,
     ProviderKeyError,
-    ProviderSafetyBufferingError,
 )
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.llm.fastagent_llm import FastAgentLLM
@@ -32,6 +31,7 @@ from fast_agent.llm.provider.openai._stream_capture import (
 from fast_agent.llm.provider.openai._stream_capture import (
     stream_capture_filename as _stream_capture_filename,
 )
+from fast_agent.llm.provider.openai.responses_cache import prepare_cached_request
 from fast_agent.llm.provider.openai.responses_content import ResponsesContentMixin
 from fast_agent.llm.provider.openai.responses_files import ResponsesFileMixin
 from fast_agent.llm.provider.openai.responses_output import ResponsesOutputMixin
@@ -225,6 +225,7 @@ class ResponsesLLM(
             )
 
     def _initialize_response_state(self, web_search_override: Any) -> None:
+        self._responses_prompt_cache_key = uuid4().hex
         self._tool_call_id_map: dict[str, str] = {}
         self._tool_name_map: dict[str, str] = {}
         self._tool_kind_map: dict[str, Literal["function", "custom"]] = {}
@@ -800,7 +801,18 @@ class ResponsesLLM(
         if last_message.role == "assistant":
             return last_message
 
-        input_items = self._convert_to_provider_format(multipart_messages)
+        cache_state = None
+        if self.provider in {Provider.RESPONSES, Provider.CODEX_RESPONSES}:
+            input_items, cache_state, req_params = prepare_cached_request(
+                multipart_messages,
+                req_params,
+                key=self._responses_prompt_cache_key,
+                default_effort=self._resolve_reasoning_effort(),
+                convert=self._convert_message_to_items,
+            )
+            input_items = self._dedupe_input_items(input_items)
+        else:
+            input_items = self._convert_to_provider_format(multipart_messages)
         if not input_items:
             input_items = [
                 {
@@ -810,7 +822,10 @@ class ResponsesLLM(
                 }
             ]
 
-        return await self._responses_completion(input_items, req_params, tools)
+        response = await self._responses_completion(input_items, req_params, tools)
+        if cache_state is not None:
+            cache_state.attach(response)
+        return response
 
     def _build_web_search_tool(
         self,
@@ -968,6 +983,8 @@ class ResponsesLLM(
             "include": [RESPONSE_INCLUDE_REASONING],
             "parallel_tool_calls": request_params.parallel_tool_calls,
         }
+        if self.provider in {Provider.RESPONSES, Provider.CODEX_RESPONSES}:
+            base_args["prompt_cache_key"] = self._responses_prompt_cache_key
 
         system_prompt = self.instruction or request_params.system_prompt
         if system_prompt:
@@ -1186,9 +1203,16 @@ class ResponsesLLM(
             if getattr(output_item, "type", None) != "message":
                 continue
             response_content_blocks.extend(
-                TextContent(type="text", text=getattr(part, "text", ""))
+                TextContent(
+                    type="text",
+                    text=(
+                        getattr(part, "refusal", "")
+                        if getattr(part, "type", None) == "refusal"
+                        else getattr(part, "text", "")
+                    ),
+                )
                 for part in getattr(output_item, "content", []) or []
-                if getattr(part, "type", None) == "output_text"
+                if getattr(part, "type", None) in {"output_text", "refusal"}
             )
 
         if not response_content_blocks:
@@ -1209,7 +1233,10 @@ class ResponsesLLM(
 
         self._log_chat_finished(model=context.model_name)
         channels = self._responses_reasoning_channels(response, result.streamed_summary)
-        tool_calls = self._extract_tool_calls(response)
+        stop_reason = self._map_response_stop_reason(response)
+        tool_calls = (
+            None if stop_reason == LlmStopReason.SAFETY else self._extract_tool_calls(response)
+        )
         channels, message_phase = self._responses_raw_item_channels(response, channels)
         channels = self._responses_diagnostics_channels(channels)
         channels = self._responses_server_tool_channels(response, channels)
@@ -1228,9 +1255,7 @@ class ResponsesLLM(
             content=self._responses_content_blocks(response),
             tool_calls=tool_calls,
             channels=channels,
-            stop_reason=(
-                LlmStopReason.TOOL_USE if tool_calls else self._map_response_stop_reason(response)
-            ),
+            stop_reason=(LlmStopReason.TOOL_USE if tool_calls else stop_reason),
             phase=message_phase,
         )
 
@@ -1269,29 +1294,6 @@ class ResponsesLLM(
         )
         return build_stream_failure_response(self.provider, error, context.model_name)
 
-    def _safety_buffering_response(
-        self,
-        error: ProviderSafetyBufferingError,
-    ) -> PromptMessageExtended:
-        details = {
-            "provider": self.provider.value,
-            "category": "safety_buffering",
-            "model": error.model,
-            "reasons": error.reasons,
-            "use_cases": error.use_cases,
-            "retry_model": error.retry_model,
-        }
-        return PromptMessageExtended(
-            role="assistant",
-            content=[TextContent(type="text", text=error.message)],
-            channels={
-                FAST_AGENT_SAFETY_DETAILS: [
-                    TextContent(type="text", text=json.dumps(details)),
-                ]
-            },
-            stop_reason=LlmStopReason.SAFETY,
-        )
-
     async def _responses_completion(
         self,
         input_items: list[dict[str, Any]],
@@ -1308,8 +1310,6 @@ class ResponsesLLM(
                 tools=tools,
                 context=context,
             )
-        except ProviderSafetyBufferingError as error:
-            return self._safety_buffering_response(error)
         except asyncio.CancelledError:
             return Prompt.assistant(
                 TextContent(type="text", text=""),
@@ -1334,8 +1334,6 @@ class ResponsesLLM(
                 tools=tools,
                 context=context,
             )
-        except ProviderSafetyBufferingError as error:
-            return self._safety_buffering_response(error)
         except asyncio.CancelledError:
             return Prompt.assistant(
                 TextContent(type="text", text=""),
@@ -1719,9 +1717,6 @@ class ResponsesLLM(
                     reconnected=reconnected,
                 )
                 return result.response, result.streamed_summary, result.input_items
-            except ProviderSafetyBufferingError as error:
-                attempt_state.planner.rollback(error, stream_started=True)
-                raise
             except ResponsesWebSocketError as error:
                 last_error = self._handle_responses_ws_error(
                     error=error, attempt_state=attempt_state, context=context
@@ -1774,6 +1769,7 @@ class ResponsesLLM(
 
     def clear(self, *, clear_prompts: bool = False) -> None:
         super().clear(clear_prompts=clear_prompts)
+        self._responses_prompt_cache_key = uuid4().hex
         self._tool_call_id_map.clear()
         self._tool_kind_map.clear()
         self._seen_tool_call_ids.clear()

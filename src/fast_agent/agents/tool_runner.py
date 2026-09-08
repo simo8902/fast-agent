@@ -18,6 +18,7 @@ from fast_agent.constants import (
     FAST_AGENT_PENDING_MEDIA_ATTACHMENTS,
     FAST_AGENT_SYNTHETIC_FINAL_CHANNEL,
     FAST_AGENT_TIMING,
+    FAST_AGENT_TOOL_MEDIA_MESSAGE,
     FAST_AGENT_USAGE,
 )
 from fast_agent.core.logging.logger import get_logger
@@ -609,8 +610,6 @@ class ToolRunner:
             tool_message = await self._agent.run_tools(
                 self._pending_tool_request, request_params=self._request_params
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
             tool_calls = self._pending_tool_request.tool_calls or {}
             tool_call_ids = list(tool_calls.keys())
@@ -698,7 +697,15 @@ class ToolRunner:
             del visible_channels[FAST_AGENT_PENDING_MEDIA_ATTACHMENTS]
             staged_messages = [
                 tool_message.model_copy(update={"channels": visible_channels or None}),
-                PromptMessageExtended(role="user", content=list(pending_media)),
+                PromptMessageExtended(
+                    role="user",
+                    content=list(pending_media),
+                    channels={
+                        FAST_AGENT_TOOL_MEDIA_MESSAGE: [
+                            TextContent(type="text", text="Tool media continuation")
+                        ]
+                    },
+                ),
             ]
 
         if self._use_history_enabled():
