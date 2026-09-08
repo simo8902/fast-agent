@@ -977,6 +977,11 @@ async def test_local_read_text_file_option_is_enabled_by_default() -> None:
 @pytest.mark.parametrize(
     "model_name",
     [
+        "codexplan",
+        "astra",
+        "gpt-6-astra",
+        "codexresponses.gpt-6-astra",
+        "responses.gpt-6-astra",
         "gpt-5.2",
         "gpt-5.4",
         "responses.gpt-5.4",
